@@ -16,11 +16,13 @@ export interface MandateCardData {
 
 interface MandateCardProps {
   data: MandateCardData;
+  mandateJson?: object;                      // raw mandate from API for signing
+  onSign?: (signedMandate: object) => void;  // called after successful sign
 }
 
 // ── MandateCard ────────────────────────────────────────────────
 
-export function MandateCard({ data }: MandateCardProps) {
+export function MandateCard({ data, mandateJson, onSign }: MandateCardProps) {
   const [secondsLeft, setSecondsLeft] = useState(data.expiresInSeconds);
   const [signed, setSigned] = useState(false);
   const [declined, setDeclined] = useState(false);
@@ -129,7 +131,22 @@ export function MandateCard({ data }: MandateCardProps) {
           ) : (
             <div className="flex flex-col gap-2">
               <button
-                onClick={() => setSigned(true)}
+                onClick={async () => {
+                  setSigned(true);
+                  if (mandateJson && onSign) {
+                    try {
+                      const res = await fetch("/api/mandate/sign", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ mandate: mandateJson }),
+                      });
+                      const json = await res.json();
+                      if (json.mandate) onSign(json.mandate);
+                    } catch {
+                      // sign failure doesn't block UI
+                    }
+                  }
+                }}
                 className="w-full py-3.5 rounded-sm bg-black text-white font-sans font-bold text-[15px] hover:bg-black/80 active:scale-[0.99] transition-all duration-150 border border-white/[0.08]"
               >
                 Accept (Sign)

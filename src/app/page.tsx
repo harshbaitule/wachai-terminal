@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { GlassInput, SuggestionChips } from "@/components/ui/glass-input";
@@ -9,8 +9,10 @@ import { ThinkingRing } from "@/components/ui/thinking-ring";
 import { MandateCard, type MandateCardData } from "@/components/ui/mandate-card";
 import { PortfolioCard } from "@/components/ui/portfolio-card";
 
+// ── Constants ─────────────────────────────────────────────────
+
 const SUGGESTIONS = [
-  "Swap 100 USD to BTC",
+  "Swap 100 USDT to WBTC",
   "Give me a rundown of my portfolio",
   "Can you verify $PEPE",
 ];
@@ -25,8 +27,9 @@ const SWAP_STEPS = [
   "Assessing Risk",
 ];
 
-const SWAP_MANDATE: MandateCardData = {
-  id: "spaceformandate ID",
+// Fallback mock shown while API is in-flight or env not configured
+const FALLBACK_MANDATE: MandateCardData = {
+  id: "pending",
   subtitle: "Swap 100 USDC for WBTC",
   from: { amount: "100.00", usdValue: "$100.00", token: "USDC" },
   to:   { amount: "0.00165", usdValue: "$102.00", token: "WBTC" },
@@ -35,40 +38,104 @@ const SWAP_MANDATE: MandateCardData = {
   recipient: "0x742d…abcd",
 };
 
+// ── Helpers ───────────────────────────────────────────────────
+
 type Intent = "swap" | "portfolio" | "other";
 type Phase  = "idle" | "thinking" | "done";
 
 function detectIntent(msg: string): Intent {
   const l = msg.toLowerCase();
   if (l.includes("portfolio") || l.includes("rundown") || l.includes("balance")) return "portfolio";
-  if (l.includes("swap") || l.includes("usd") || l.includes("btc") || l.includes("eth")) return "swap";
+  if (/swap|usdt|usdc|wbtc|eth|btc|usd/.test(l)) return "swap";
   return "other";
 }
 
+/** Parse a mandate API response into MandateCardData for the UI */
+function parseMandateToCardData(mandate: Record<string, unknown>): MandateCardData {
+  const core = mandate.core as Record<string, unknown> | undefined;
+  const payload = (core?.payload ?? {}) as Record<string, unknown>;
+  const intent  = (mandate.intent as string) ?? "";
+
+  // Try to reconstruct human-readable amounts from the core payload
+  const amountIn  = String(payload.amountIn  ?? "");
+  const recipient = String(payload.recipient ?? mandate.client ?? "");
+
+  // Derive from/to tokens from the intent string (fallback to payload addresses)
+  const intentMatch = intent.match(/swap\s+([\d,.]+)\s+(\w+)\s+(?:to|for)\s+(\w+)/i);
+  const fromToken = intentMatch?.[2]?.toUpperCase() ?? "USDC";
+  const toToken   = intentMatch?.[3]?.toUpperCase() ?? "WBTC";
+  const rawAmt    = intentMatch?.[1] ?? amountIn;
+
+  const deadline    = new Date(payload.deadline as string ?? mandate.deadline as string ?? Date.now() + 600_000);
+  const expiresInSecs = Math.max(0, Math.floor((deadline.getTime() - Date.now()) / 1000));
+
+  return {
+    id:       (mandate.mandateId as string) ?? "—",
+    subtitle: intent || `Swap ${fromToken} → ${toToken}`,
+    from: { amount: rawAmt, usdValue: `$${rawAmt}`, token: fromToken },
+    to:   { amount: "—",   usdValue: "—",           token: toToken  },
+    expiresInSeconds: expiresInSecs,
+    network:   "Base",
+    recipient: recipient.replace(/^eip155:\d+:/, "").slice(0, 6) + "…" + recipient.slice(-4),
+  };
+}
+
+// ── Component ─────────────────────────────────────────────────
+
 export default function HomePage() {
-  const [sidebarOpen, setSidebarOpen]   = useState(false);
-  const [phase, setPhase]               = useState<Phase>("idle");
-  const [intent, setIntent]             = useState<Intent>("other");
-  const [userMessage, setUserMessage]   = useState("");
-  const [statusIdx, setStatusIdx]       = useState(0);
+  const [sidebarOpen, setSidebarOpen]     = useState(false);
+  const [phase, setPhase]                 = useState<Phase>("idle");
+  const [intent, setIntent]               = useState<Intent>("other");
+  const [userMessage, setUserMessage]     = useState("");
+  const [statusIdx, setStatusIdx]         = useState(0);
   const [statusVisible, setStatusVisible] = useState(true);
-  const [thinkSecs, setThinkSecs]       = useState(0);
+  const [thinkSecs, setThinkSecs]         = useState(0);
+
+  // Live mandate from API
+  const [liveMandate, setLiveMandate]           = useState<MandateCardData | null>(null);
+  const [liveMandateJson, setLiveMandateJson]   = useState<object | null>(null);
+  const [signedMandateJson, setSignedMandateJson] = useState<object | null>(null);
+
+  const apiAbort = useRef<AbortController | null>(null);
+
+  // ── Animation + API in parallel ─────────────────────────────
 
   useEffect(() => {
     if (phase !== "thinking") return;
 
-    // Portfolio: show "Thinking..." for 3s then done
+    // Fire API call in background (no await — runs parallel to animation)
+    apiAbort.current?.abort();
+    const ctrl = new AbortController();
+    apiAbort.current = ctrl;
+
+    fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: userMessage,
+        // TODO: replace with real wallet address from wagmi useAccount()
+        clientAddress: "0x0000000000000000000000000000000000000001",
+      }),
+      signal: ctrl.signal,
+    })
+      .then((r) => r.json())
+      .then((json) => {
+        if (json.mandate) {
+          setLiveMandateJson(json.mandate);
+          setLiveMandate(parseMandateToCardData(json.mandate as Record<string, unknown>));
+        }
+      })
+      .catch(() => {/* API unavailable — fallback data shown */});
+
+    // Portfolio: 3 s then done
     if (intent === "portfolio") {
       const start = Date.now();
-      const tick = setInterval(() => setThinkSecs(Math.floor((Date.now() - start) / 100) / 10), 100);
-      const done = setTimeout(() => {
-        clearInterval(tick);
-        setPhase("done");
-      }, 3000);
-      return () => { clearInterval(tick); clearTimeout(done); };
+      const tick  = setInterval(() => setThinkSecs(Math.floor((Date.now() - start) / 100) / 10), 100);
+      const done  = setTimeout(() => { clearInterval(tick); setPhase("done"); }, 3000);
+      return () => { clearInterval(tick); clearTimeout(done); ctrl.abort(); };
     }
 
-    // Swap: cycle through all steps
+    // Swap: cycle steps then done
     let i = 0;
     const timer = setInterval(() => {
       setStatusVisible(false);
@@ -79,13 +146,17 @@ export default function HomePage() {
         setStatusVisible(true);
       }, 280);
     }, 900);
-    return () => clearInterval(timer);
-  }, [phase, intent]);
+    return () => { clearInterval(timer); ctrl.abort(); };
+  }, [phase, intent, userMessage]);
+
+  // ── Handlers ─────────────────────────────────────────────────
 
   function handleSubmit(msg: string) {
-    const det = detectIntent(msg);
+    setLiveMandate(null);
+    setLiveMandateJson(null);
+    setSignedMandateJson(null);
     setUserMessage(msg);
-    setIntent(det);
+    setIntent(detectIntent(msg));
     setStatusIdx(0);
     setStatusVisible(true);
     setThinkSecs(0);
@@ -93,16 +164,25 @@ export default function HomePage() {
   }
 
   function handleReset() {
+    apiAbort.current?.abort();
     setPhase("idle");
     setUserMessage("");
     setStatusIdx(0);
     setThinkSecs(0);
+    setLiveMandate(null);
+    setLiveMandateJson(null);
+    setSignedMandateJson(null);
   }
 
-  // Label shown next to avatar when done
   const doneLabel = intent === "portfolio"
     ? `Thought for ${thinkSecs.toFixed(1)}s`
-    : "Swapping all your USDT Balance now";
+    : signedMandateJson
+      ? "Mandate signed — swap queued"
+      : "Swapping all your USDT Balance now";
+
+  // Use live mandate if ready, otherwise fallback mock
+  const mandateData    = liveMandate ?? FALLBACK_MANDATE;
+  const mandateJsonRaw = liveMandateJson ?? null;
 
   return (
     <div className="h-screen bg-bg-base flex overflow-hidden">
@@ -137,7 +217,7 @@ export default function HomePage() {
           </Link>
         </div>
 
-        {/* ── IDLE ────────────────────────────────────────────────── */}
+        {/* ── IDLE ────────────────────────────────────────────── */}
         {phase === "idle" && (
           <div className="relative z-10 flex-1 flex flex-col items-center justify-center px-6 animate-fade-up">
             <div className="flex flex-col items-center gap-6 w-full max-w-[704px]">
@@ -156,7 +236,7 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* ── THINKING / DONE ─────────────────────────────────────── */}
+        {/* ── THINKING / DONE ─────────────────────────────────── */}
         {phase !== "idle" && (
           <div className="relative z-10 flex-1 flex flex-col overflow-hidden animate-fade-up">
 
@@ -177,9 +257,7 @@ export default function HomePage() {
                   </ThinkingRing>
 
                   {phase === "thinking" && intent === "portfolio" && (
-                    <span className="font-mono text-[15px] text-white/55 transition-opacity duration-200">
-                      Thinking...
-                    </span>
+                    <span className="font-mono text-[15px] text-white/55">Thinking...</span>
                   )}
 
                   {phase === "thinking" && intent !== "portfolio" && (
@@ -196,7 +274,7 @@ export default function HomePage() {
                   )}
                 </div>
 
-                {/* Result card */}
+                {/* ── Result cards ──────────────────────────────── */}
                 {phase === "done" && intent === "portfolio" && (
                   <div className="animate-fade-up">
                     <PortfolioCard />
@@ -205,7 +283,18 @@ export default function HomePage() {
 
                 {phase === "done" && intent === "swap" && (
                   <div className="animate-fade-up">
-                    <MandateCard data={SWAP_MANDATE} />
+                    <MandateCard
+                      data={mandateData}
+                      mandateJson={mandateJsonRaw ?? undefined}
+                      onSign={(signed) => setSignedMandateJson(signed)}
+                    />
+
+                    {/* Mandate ID pill */}
+                    {liveMandate && mandateData.id !== "pending" && (
+                      <p className="mt-2 font-mono text-[11px] text-white/25 truncate">
+                        mandate: {mandateData.id}
+                      </p>
+                    )}
                   </div>
                 )}
 
